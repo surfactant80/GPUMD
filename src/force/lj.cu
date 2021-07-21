@@ -14,54 +14,27 @@
 */
 
 /*----------------------------------------------------------------------------80
-The class dealing with the Lennard-Jones (LJ) pairwise potentials.
+The class dealing with the RDIP potential.
 ------------------------------------------------------------------------------*/
 
 #include "lj.cuh"
 #include "utilities/error.cuh"
-
-// best block size here: 128
 #define BLOCK_SIZE_FORCE 128
 
 LJ::LJ(FILE* fid, int num_types)
 {
-  printf("Use %d-element LJ potential.\n", num_types);
-  if (!(num_types >= 1 && num_types <= MAX_TYPE)) {
-    PRINT_INPUT_ERROR("Incorrect number of LJ parameters.\n");
-  }
-
-  double epsilon, sigma, cutoff;
-  rc = 0.0;
-  for (int n = 0; n < num_types; n++) {
-    for (int m = 0; m < num_types; m++) {
-      int count = fscanf(fid, "%lf%lf%lf", &epsilon, &sigma, &cutoff);
-      PRINT_SCANF_ERROR(count, 3, "Reading error for LJ potential.");
-
-      lj_para.s6e4[n][m] = pow(sigma, 6.0) * epsilon * 4.0;
-      lj_para.s12e4[n][m] = pow(sigma, 12.0) * epsilon * 4.0;
-      lj_para.cutoff_square[n][m] = cutoff * cutoff;
-      if (rc < cutoff)
-        rc = cutoff;
-    }
-  }
+  printf("Use the RDIP potential.\n");
+  int count = fscanf(
+    fid, "%f%f%f%f%f%f%f%f%f%f", &lj_para.A, &lj_para.B, &lj_para.C, &lj_para.D1, &lj_para.D2,
+    &lj_para.z0, &lj_para.alpha, &lj_para.lambda1, &lj_para.lambda2, &lj_para.rc);
+  PRINT_SCANF_ERROR(count, 10, "Reading error for RDIP potential.");
+  lj_para.z02 = lj_para.z0 * lj_para.z0;
+  lj_para.Az06 = lj_para.A * lj_para.z02 * lj_para.z02 * lj_para.z02;
+  rc = lj_para.rc;
 }
 
-LJ::~LJ(void)
-{
-  // nothing
-}
+LJ::~LJ(void) {}
 
-// get U_ij and (d U_ij / d r_ij) / r_ij (the LJ potential)
-static __device__ void
-find_p2_and_f2(double s6e4, double s12e4, double d12sq, double& p2, double& f2)
-{
-  double d12inv2 = 1.0 / d12sq;
-  double d12inv6 = d12inv2 * d12inv2 * d12inv2;
-  f2 = 6.0 * (s6e4 * d12inv6 - s12e4 * 2.0 * d12inv6 * d12inv6) * d12inv2;
-  p2 = s12e4 * d12inv6 * d12inv6 - s6e4 * d12inv6;
-}
-
-// force evaluation kernel
 static __global__ void gpu_find_force(
   LJ_Para lj,
   const int number_of_particles,
@@ -96,61 +69,66 @@ static __global__ void gpu_find_force(
   double s_szy = 0.0;                                  // virial_stress_zy
   double s_szz = 0.0;                                  // virial_stress_zz
 
-  if (n1 >= N1 && n1 < N2) {
+  if (n1 < N2) {
     int neighbor_number = g_neighbor_number[n1];
-    int type1 = g_type[n1] - shift;
     double x1 = g_x[n1];
     double y1 = g_y[n1];
     double z1 = g_z[n1];
 
     for (int i1 = 0; i1 < neighbor_number; ++i1) {
       int n2 = g_neighbor_list[n1 + number_of_particles * i1];
-      int type2 = g_type[n2] - shift;
 
-      double x12 = g_x[n2] - x1;
-      double y12 = g_y[n2] - y1;
-      double z12 = g_z[n2] - z1;
-      apply_mic(box, x12, y12, z12);
-      double d12sq = x12 * x12 + y12 * y12 + z12 * z12;
+      double x12double = g_x[n2] - x1;
+      double y12double = g_y[n2] - y1;
+      double z12double = g_z[n2] - z1;
+      apply_mic(box, x12double, y12double, z12double);
+      float x12 = float(x12double);
+      float y12 = float(y12double);
+      float z12 = float(z12double);
 
-      double p2, f2;
-      if (d12sq >= lj.cutoff_square[type1][type2]) {
-        continue;
-      }
-      find_p2_and_f2(lj.s6e4[type1][type2], lj.s12e4[type1][type2], d12sq, p2, f2);
+      float rhosq = x12 * x12 + y12 * y12;
+      float d12sq = rhosq + z12 * z12;
+      float d12 = sqrt(d12sq);
+      float d12inv = 1 / d12;
+      float d12inv2 = d12inv * d12inv;
+      float d12inv4 = d12inv2 * d12inv2;
+      float d12inv6 = d12inv4 * d12inv2;
+      float d12inv8 = d12inv6 * d12inv2;
 
-      // treat two-body potential in the same way as many-body potential
-      double f12x = f2 * x12 * 0.5;
-      double f12y = f2 * y12 * 0.5;
-      double f12z = f2 * z12 * 0.5;
-      double f21x = -f12x;
-      double f21y = -f12y;
-      double f21z = -f12z;
+      float D_factor = lj.C * (1 + lj.D1 * rhosq + lj.D2 * rhosq * rhosq);
+      float exp_alpha = lj.B * exp(-lj.alpha * (d12 - lj.z0));
+      float exp_lambda = exp(-lj.lambda1 * rhosq - lj.lambda2 * (z12 * z12 - lj.z02));
 
-      // accumulate force
-      s_fx += f12x - f21x;
-      s_fy += f12y - f21y;
-      s_fz += f12z - f21z;
+      float tmp = -6.0f * lj.Az06 * d12inv8 - lj.alpha * exp_alpha * d12inv;
+      float f12x = tmp * x12;
+      float f12y = tmp * y12;
+      float f12z = tmp * z12;
+      tmp = 2 * exp_lambda * ((lj.D1 + 2 * lj.D2 * rhosq) * lj.C - lj.lambda1 * D_factor);
+      f12x += tmp * x12;
+      f12y += tmp * y12;
+      tmp = -2 * lj.lambda2 * D_factor * exp_lambda;
+      f12z += tmp * z12;
 
-      // accumulate potential energy and virial
-      s_pe += p2 * 0.5; // two-body potential
-      s_sxx += x12 * f21x;
-      s_sxy += x12 * f21y;
-      s_sxz += x12 * f21z;
-      s_syx += y12 * f21x;
-      s_syy += y12 * f21y;
-      s_syz += y12 * f21z;
-      s_szx += z12 * f21x;
-      s_szy += z12 * f21y;
-      s_szz += z12 * f21z;
+      s_pe += 0.5f * (lj.Az06 * d12inv6 + exp_alpha + D_factor * exp_lambda);
+      s_fx += f12x;
+      s_fy += f12y;
+      s_fz += f12z;
+      f12x *= 0.5f;
+      f12y *= 0.5f;
+      f12z *= 0.5f;
+      s_sxx -= x12 * f12x;
+      s_sxy -= x12 * f12y;
+      s_sxz -= x12 * f12z;
+      s_syx -= y12 * f12x;
+      s_syy -= y12 * f12y;
+      s_syz -= y12 * f12z;
+      s_szx -= z12 * f12x;
+      s_szy -= z12 * f12y;
+      s_szz -= z12 * f12z;
     }
-
-    // save force
     g_fx[n1] += s_fx;
     g_fy[n1] += s_fy;
     g_fz[n1] += s_fz;
-
-    // save virial
     // xx xy xz    0 3 4
     // yx yy yz    6 1 5
     // zx zy zz    7 8 2
@@ -163,13 +141,10 @@ static __global__ void gpu_find_force(
     g_virial[n1 + 6 * number_of_particles] += s_syx;
     g_virial[n1 + 7 * number_of_particles] += s_szx;
     g_virial[n1 + 8 * number_of_particles] += s_szy;
-
-    // save potential
     g_potential[n1] += s_pe;
   }
 }
 
-// Find force and related quantities for pair potentials (A wrapper)
 void LJ::compute(
   const int type_shift,
   const Box& box,
