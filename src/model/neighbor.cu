@@ -159,35 +159,6 @@ void Neighbor::check_bound(void)
   }
 }
 
-// simple version for sorting the neighbor indicies of each atom
-#ifdef DEBUG
-static __global__ void gpu_sort_neighbor_list(const int N, const int* NN, int* NL)
-{
-  int bid = blockIdx.x;
-  int tid = threadIdx.x;
-  int neighbor_number = NN[bid];
-  int atom_index;
-  extern __shared__ int atom_index_copy[];
-
-  if (tid < neighbor_number) {
-    atom_index = NL[bid + tid * N];
-    atom_index_copy[tid] = atom_index;
-  }
-  int count = 0;
-  __syncthreads();
-
-  for (int j = 0; j < neighbor_number; ++j) {
-    if (atom_index > atom_index_copy[j]) {
-      count++;
-    }
-  }
-
-  if (tid < neighbor_number) {
-    NL[bid + count * N] = atom_index;
-  }
-}
-#endif
-
 void Neighbor::find_neighbor(const Box& box, double* x, double* y, double* z)
 {
   const int N = NN.size();
@@ -240,10 +211,6 @@ void Neighbor::find_neighbor(const Box& box, double* x, double* y, double* z)
     find_neighbor_ON2(box, x, y, z);
   } else {
     find_neighbor_ON1(cell_n_x, cell_n_y, cell_n_z, box, x, y, z);
-#ifdef DEBUG
-    const int smem = MN * sizeof(int);
-    gpu_sort_neighbor_list<<<N, MN, smem>>>(N, NN.data(), NL.data());
-#endif
   }
 }
 
